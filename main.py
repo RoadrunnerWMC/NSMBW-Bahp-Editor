@@ -45,7 +45,7 @@ def assertMido(to_or_from):
 def createMidi(tempo, bahp_points):
     """
     Create a mido.MidiFile object from an initial tempo (int) and a list
-    of bahp points (ints)
+    of bahp points (each element is a tuple: (tick, pitch, velocity, duration))
     """
     assertMido('to')
 
@@ -61,20 +61,19 @@ def createMidi(tempo, bahp_points):
 
     # Bahps (notes)
     current_time = 0
-    NOTE_LEN = QUARTER_NOTE // 4
-    for t in bahp_points:
-        track.append(mido.Message('note_on', note=MIDDLE_C, velocity=127, time=(t - current_time)))
-        track.append(mido.Message('note_off', note=MIDDLE_C, velocity=0, time=NOTE_LEN))
-        current_time = t + NOTE_LEN
+    for t, p, v, d in bahp_points:
+        track.append(mido.Message('note_on', note=p, velocity=v, time=(t - current_time)))
+        track.append(mido.Message('note_off', note=p, velocity=0, time=d))
+        current_time = t + d
 
     return midi
 
 
-def readMidi(filename, only_middle_c):
+def readMidi(filename):
     """
     Read a MIDI from the provided filename, and return its tempo (int)
-    and a list of bahp points (ints).
-    If only_middle_c is True, notes other than Middle C will be ignored.
+    and a list of bahp points (each element is a tuple: (tick, pitch,
+    velocity, duration)).
     """
     assertMido('from')
 
@@ -103,11 +102,12 @@ def readMidi(filename, only_middle_c):
             # Ignore note_on events with velocity=0, because that is
             # equivalent to note_off
             # https://www.midi.org/forum/228-writing-midi-software-send-note-off,-or-zero-velocity-note-on
-            if msg.type == 'note_on' and msg.velocity > 0:
-                if only_middle_c and msg.note != MIDDLE_C:
-                    continue
-
-                bahp_points.append(int(round(current_time * QUARTER_NOTE / midi.ticks_per_beat)))
+            if msg.type in ['note_on', 'note_off']:
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    bahp_points.append([int(round(current_time * QUARTER_NOTE / midi.ticks_per_beat)), msg.note, msg.velocity, 0])
+                    noteStartTime = current_time
+                else:
+                    bahp_points[-1][-1] = current_time - noteStartTime
 
     bahp_points.sort()
     return tempo, bahp_points
@@ -148,7 +148,7 @@ def jsonMidi2Brseq(args):
     # Create the 'tempo' and 'bahp_points' JSON elements from a MIDI
     # file, if provided
     if args.midi is not None:
-        bahpInfo['tempo'], bahpInfo['bahp_points'] = readMidi(args.midi, args.only_middle_c)
+        bahpInfo['tempo'], bahpInfo['bahp_points'] = readMidi(args.midi)
 
     # This could be a common mistake
     if 'tempo' not in bahpInfo or 'bahp_points' not in bahpInfo:
@@ -173,8 +173,6 @@ def main():
                         help='output file (BRSEQ or JSON)')
     parser.add_argument('--midi', type=pathlib.Path, metavar='midi_file',
                         help='midi file (input if converting JSON+MIDI -> BRSEQ, or output if converting BRSEQ -> JSON+MIDI)')
-    parser.add_argument('--only_middle_c', action='store_true',
-                        help='ignore notes other than Middle C when importing a MIDI')
     args = parser.parse_args()
 
     # First, detect file type

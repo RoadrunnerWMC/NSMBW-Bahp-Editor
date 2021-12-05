@@ -137,6 +137,16 @@ class RSEQEvent:
             'load themselves from data without context can implement this.')
 
 
+    @classmethod
+    def fromJSON(cls, type, data, startOffset=0):
+        raise NotImplementedError('RSEQEvent subclasses that can '
+            'load themselves from JSON without context can implement this.')
+
+
+    def asJSON(self):
+        raise NotImplementedError('RSEQEvent subclasses should implement this.')
+
+
     def __str__(self):
         return f'<sequence event {hex(self.type)}>'
 
@@ -162,6 +172,13 @@ def _make_simple_sequence_event_class(typeNum, shortName, name, description):
     def fromData(cls, type, data, startOffset=0):
         return cls(data[startOffset + 1])
 
+    @classmethod
+    def fromJSON(cls, type, value):
+        return cls(value)
+
+    def asJSON(self):
+        return (self.type, self.value)
+
     def __str__(self):
         return f'<{shortName.lower()} {self.value}>'
 
@@ -174,6 +191,8 @@ def _make_simple_sequence_event_class(typeNum, shortName, name, description):
                  '__init__': __init__,
                  'save': save,
                  'fromData': fromData,
+                 'fromJSON': fromJSON,
+                 'asJSON': asJSON,
                  '__str__': __str__,
                  '__repr__': __repr__,
                  'dataLength': 2})
@@ -225,6 +244,13 @@ class NoteSequenceEvent(RSEQEvent):
         duration = _readVariableLengthInt(data, startOffset + 2)
         return cls(type, velocity, duration)
 
+    @classmethod
+    def fromJSON(cls, type, velocity, unknownFlag, duration):
+        return cls(type, velocity, (unknownFlag << 7) | duration)
+
+    def asJSON(self):
+        return (self.type, self.velocity, self.unknownFlag, self.duration)
+
     def __str__(self):
         flag = ' unknown-flag' if self.unknownFlag else ''
         return f'<{self.name} velocity={self.velocity} duration={self.duration}{flag}>'
@@ -254,6 +280,13 @@ class RestSequenceEvent(RSEQEvent):
     def fromData(cls, type, data, startOffset=0):
         duration = _readVariableLengthInt(data, startOffset + 1)
         return cls(duration)
+
+    @classmethod
+    def fromJSON(cls, type, duration):
+        return cls(duration)
+
+    def asJSON(self):
+        return (self.type, self.duration)
 
     def __str__(self):
         return f'<rest {self.duration}>'
@@ -287,11 +320,41 @@ class InstrumentSwitchSequenceEvent(RSEQEvent):
         bankID = value >> 7
         return cls(bankID, instrumentID)
 
+    @classmethod
+    def fromJSON(cls, type, bankID, instrumentID):
+        return cls(bankID, instrumentID)
+
+    def asJSON(self):
+        return (self.type, self.bankID, self.instrumentID)
+
     def __str__(self):
         return f'<instrument {self.bankID}/{self.instrumentID}>'
 
     def __repr__(self):
         return f'{type(self).__name__}({self.bankID!r}, {self.instrumentID!r})'
+
+
+class BeginTrackSequenceEvent(RSEQEvent):
+    """
+    0x93
+    """
+    dataLength = 5
+
+    def __init__(self, trackNumber, firstEvent):
+        super().__init__(0x93)
+        self.trackNumber = trackNumber
+        self.firstEvent = firstEvent
+
+    def save(self, eventsToOffsets=None):
+        return (super().save()
+                + self.trackNumber.to_bytes(1, 'big')
+                + eventsToOffsets[self.firstEvent].to_bytes(3, 'big'))
+
+    def __str__(self):
+        return f'<begin track {self.trackNumber} id={id(self.firstEvent)}>'
+
+    def __repr__(self):
+        return f'{type(self).__name__}({self.trackNumber!r}, {self.firstEvent!r} at {id(self.firstEvent)})'
 
 
 class JumpSequenceEvent(RSEQEvent):
@@ -359,6 +422,13 @@ class MonoPolySequenceEvent(RSEQEvent):
     def fromData(cls, type, data, startOffset=0):
         return cls(data[startOffset + 1])
 
+    @classmethod
+    def fromJSON(cls, type, value):
+        return cls(value)
+
+    def asJSON(self):
+        return (self.type, self.value.value)
+
     def __str__(self):
         return '<mono>' if self.value else '<poly>'
 
@@ -380,6 +450,13 @@ class TempoSequenceEvent(RSEQEvent):
     def fromData(cls, type, data, startOffset=0):
         return cls(struct.unpack_from('>H', data, startOffset + 1)[0])
 
+    @classmethod
+    def fromJSON(cls, type, value):
+        return cls(value)
+
+    def asJSON(self):
+        return (self.type, self.value)
+
     def save(self, eventsToOffsets=None):
         return super().save() + struct.pack('>H', self.value)
 
@@ -388,6 +465,10 @@ class TempoSequenceEvent(RSEQEvent):
 
     def __repr__(self):
         return f'{type(self).__name__}({self.value!r})'
+
+
+UnknownDESequenceEvent = _make_simple_sequence_event_class(0xDE,
+    'unknown-de', 'UnknownDESequenceEvent', '')
 
 
 class UnknownF0SequenceEvent(RSEQEvent):
@@ -399,7 +480,7 @@ class UnknownF0SequenceEvent(RSEQEvent):
 
     def __init__(self, value):
         super().__init__(0xF0)
-        self.value = value
+        self.value = value  # (bytes of length 4)
 
     @classmethod
     def fromData(cls, type, data, startOffset=0):
@@ -408,11 +489,58 @@ class UnknownF0SequenceEvent(RSEQEvent):
     def save(self, eventsToOffsets=None):
         return super().save() + self.value
 
+    @classmethod
+    def fromJSON(cls, type, a, b, c, d):
+        return cls(bytes([a, b, c, d]))
+
+    def asJSON(self):
+        return (self.type, *self.value)
+
     def __str__(self):
         return f'<unknown-f0 {self.value!r}>'
 
     def __repr__(self):
         return f'{type(self).__name__}({self.value!r})'
+
+
+class DefineTracksSequenceEvent(RSEQEvent):
+    """
+    0xFE
+    """
+    dataLength = 3
+
+    def __init__(self, trackNumbers):
+        super().__init__(0xFE)
+        self.trackNumbers = trackNumbers
+
+    def save(self, eventsToOffsets=None):
+        tracksBitfield = 0
+        for i in range(16):
+            if i in self.trackNumbers:
+                tracksBitfield |= 1 << i
+        return super().save() + struct.pack('>H', tracksBitfield)
+
+    @classmethod
+    def fromData(cls, type, data, startOffset=0):
+        tracksBitfield, = struct.unpack_from('>H', data, startOffset + 1)
+        trackNumbers = set()
+        for i in range(16):
+            if tracksBitfield & (1 << i):
+                trackNumbers.add(i)
+        return cls(trackNumbers)
+
+    @classmethod
+    def fromJSON(cls, type, trackNumbers):
+        return cls(trackNumbers)
+
+    def asJSON(self):
+        return (self.type, self.trackNumbers)
+
+    def __str__(self):
+        return f'<define tracks {" ".join(str(x) for x in sorted(self.trackNumbers))}>'
+
+    def __repr__(self):
+        return f'{type(self).__name__}({self.trackNumbers!r})'
 
 
 class EndTrackSequenceEvent(RSEQEvent):
@@ -425,6 +553,13 @@ class EndTrackSequenceEvent(RSEQEvent):
     @classmethod
     def fromData(cls, type, data, startOffset=0):
         return cls()
+
+    @classmethod
+    def fromJSON(cls, type):
+        return cls()
+
+    def asJSON(self):
+        return (self.type)
 
     def __str__(self):
         return '<end track>'
@@ -459,14 +594,17 @@ class RawDataSequenceEvent(RSEQEvent):
 _EVENT_TYPES = {
     0x80: RestSequenceEvent,
     0x81: InstrumentSwitchSequenceEvent,
+    0x88: BeginTrackSequenceEvent,
     0xB0: UnknownB0SequenceEvent,
     0xC0: PanSequenceEvent,
     0xC1: TrackVolumeSequenceEvent,
     0xC4: PortamentoSequenceEvent,
     0xC7: MonoPolySequenceEvent,
     0xCA: ModulationDepthSequenceEvent,
+    0xDE: UnknownDESequenceEvent,
     0xE1: TempoSequenceEvent,
     0xF0: UnknownF0SequenceEvent,
+    0xFE: DefineTracksSequenceEvent,
     0xFF: EndTrackSequenceEvent,
 }
 
@@ -504,23 +642,20 @@ def readSequenceEvents(data, notableOffsets=None):
                 return fate
 
             try:
-
                 type = data[off]
 
-                # if type == 0x93: # BeginTrack
-                #     trackNumber = data[off + 1]
-                #     firstEventOff, = struct.unpack_from('>I', data, off + 1)
-                #     firstEventOff >>= 8
+                if type == 0x88: # BeginTrack
+                    trackNumber = data[off + 1]
+                    firstEventOff = int.from_bytes(data[off + 2 : off + 5], 'big') # 3-byte int
 
-                #     event = BeginTrackSequenceEvent(trackNumber, None)
-                #     events[off] = event
-                #     fates[off] = FATE_INPROGRESS
-                #     parse_at(firstEventOff)
-                #     event.firstEvent = events[firstEventOff]
+                    event = BeginTrackSequenceEvent(trackNumber, None)
+                    events[off] = event
+                    fates[off] = FATE_INPROGRESS
+                    parse_at(firstEventOff)
+                    event.firstEvent = events[firstEventOff]
 
-                if type == 0x89: # Jump
-                    destination, = struct.unpack_from('>I', data, off + 1)
-                    destination >>= 8
+                elif type == 0x89: # Jump
+                    destination = int.from_bytes(data[off + 1 : off + 4], 'big') # 3-byte int
 
                     event = JumpSequenceEvent(None)
                     events[off] = event
@@ -587,7 +722,7 @@ def readSequenceEvents(data, notableOffsets=None):
                     if type <= 0x7F:
                         eventCls = NoteSequenceEvent
                     elif type not in _EVENT_TYPES:
-                        raise ValueError(f'Event {hex(type)} unrecognized.')
+                        raise ValueError(f'Event {hex(type)} unrecognized, at {hex(off)}.')
                     else:
                         eventCls = _EVENT_TYPES[type]
 
@@ -657,6 +792,10 @@ def saveSequenceEvents(events, notableEvents=None):
     return data, notableOffsets
 
 
+class UnsupportedBRSEQError(Exception):
+    pass
+
+
 class BRSEQ:
     def __init__(self, data=None):
         self.events = [] # event, ...
@@ -680,6 +819,14 @@ class BRSEQ:
                 labelStr = lablSec[8 + offs + 8 : 8 + offs + 8 + labelStrLen].decode('latin-1')
                 labelNamesAndOffsets.append((labelStr, labelDataOffs))
                 labeledOffsets.add(labelDataOffs)
+
+            for name, _ in labelNamesAndOffsets:
+                if name == 'SMF_staffcredit_v_Begin':
+                    raise UnsupportedBRSEQError('The credits theme is unsupported.')
+                elif name.startswith('SMF_') and name.endswith('_v_Begin'):
+                    break
+            else:
+                raise UnsupportedBRSEQError('This is not a valid bahp BRSEQ.')
 
             # Read DATA and populate self.events and offs2Event
             assert dataSec.startswith(b'DATA')
@@ -722,6 +869,7 @@ class BRSEQ:
 
             lablSec.extend(struct.pack('>II', off, len(lblName)))
             lablSec.extend(lblName.encode('latin-1'))
+            lablSec.append(0)  # this is dumb, but Nintendo does it, so
             while len(lablSec) % 4:
                 lablSec.append(0)
 
@@ -746,6 +894,10 @@ class BRSEQ:
         assert beginLabel.endswith('_v_Begin')
         internalName = beginLabel[4:-8]
 
+        if isinstance(self.events[0], DefineTracksSequenceEvent):
+            # TEMP
+            raise UnsupportedBRSEQError
+
         for e in self.events:
             if isinstance(e, JumpSequenceEvent):
                 loopStart = e.destination
@@ -753,33 +905,56 @@ class BRSEQ:
         else:
             loopStart = None
 
+        header = []
+        for e in self.events:
+            if isinstance(e, (NoteSequenceEvent, RestSequenceEvent)):
+                break
+            else:
+                header.append(e.asJSON())
+
         time = 0
         tempo = 0
+        loopStartIdx = -1
         loopStartTime = -1
         loopEndTime = -1
+        trackVolumeSetAfterDelay = 0
         bahpPointTimes = []
-        for e in self.events:
+        for i, e in enumerate(self.events):
             if e is loopStart:
-                loopStartTime = time
+                if i < len(header):
+                    loopStartIdx = i
+                else:
+                    loopStartTime = time
 
             if isinstance(e, TempoSequenceEvent):
                 tempo = e.value
             elif isinstance(e, RestSequenceEvent):
                 time += e.duration
+            elif isinstance(e, NoteSequenceEvent):
+                bahpPointTimes.append((time, e.pitch, e.velocity, e.duration))
             elif isinstance(e, UnknownF0SequenceEvent):
-                bahpPointTimes.append(time)
+                bahpPointTimes.append((time, int.from_bytes(e.value[1:], 'big'), 127, 1))
+            elif isinstance(e, TrackVolumeSequenceEvent) and time > 0:
+                trackVolumeSetAfterDelay = time
             elif isinstance(e, JumpSequenceEvent):
                 loopEndTime = time
                 break
 
-        return {
+        d = {
             'version': 1,
+            'header': header,
             'internal_name': internalName,
             'tempo': tempo,
-            'loop_start': loopStartTime,
             'loop_end': loopEndTime,
             'bahp_points': bahpPointTimes,
         }
+        if loopStartIdx != -1:
+            d['loop_start_index'] = loopStartIdx
+        else:
+            d['loop_start'] = loopStartTime
+        if trackVolumeSetAfterDelay:
+            d['set_track_volume_after_delay'] = trackVolumeSetAfterDelay
+        return d
 
 
     @classmethod
@@ -789,21 +964,20 @@ class BRSEQ:
 
         self = cls()
 
-        self.events = [
-            UnknownB0SequenceEvent(96),
-            MonoPolySequenceEvent(MonoPolySequenceEvent.Value.POLY),
-            TempoSequenceEvent(info['tempo']),
-            InstrumentSwitchSequenceEvent(0, 0),
-            TrackVolumeSequenceEvent(0),
-            PanSequenceEvent(64),
-            PortamentoSequenceEvent(0),
-            ModulationDepthSequenceEvent(0),
-            NoteSequenceEvent(60, 1, 1),
-            RestSequenceEvent(info['loop_end']),
-        ]
+        self.events = [RestSequenceEvent(info['loop_end'])]
 
         timeToEvent = {0: self.events[-1]}
         def insertAtTime(t, event=None):
+
+            if t in timeToEvent:
+                followingRest = timeToEvent[t]
+                insertAt = self.events.index(followingRest)
+                while not isinstance(self.events[insertAt - 1], RestSequenceEvent):
+                    insertAt -= 1
+                if event is not None:
+                    self.events.insert(insertAt, event)
+                return self.events[insertAt]
+
             precedingRestT = max(x for x in timeToEvent if x <= t)
             precedingRest = timeToEvent[precedingRestT]
             precedingRestI = self.events.index(precedingRest)
@@ -822,19 +996,39 @@ class BRSEQ:
             return newRest
 
 
-        for t in info['bahp_points']:
-            insertAtTime(t, UnknownF0SequenceEvent(b'\x80\x00\x00\x02'))
+        for t, p, v, d in info['bahp_points']:
+            if p < 20:
+                insertAtTime(t, UnknownF0SequenceEvent(b'\x80' + p.to_bytes(3, 'big')))
+            else:
+                insertAtTime(t, NoteSequenceEvent(p, v, d))
 
-        loopStartEvent = insertAtTime(info['loop_start'])
+        if 'set_track_volume_after_delay' in info:
+            insertAtTime(info['set_track_volume_after_delay'], TrackVolumeSequenceEvent(0))
+
+        def addHeader():
+            for ed in reversed(info['header']):
+                if ed[0] < 0x80:
+                    noteCls = NoteSequenceEvent
+                else:
+                    noteCls = _EVENT_TYPES[ed[0]]
+                self.events.insert(0, noteCls.fromJSON(*ed))
+
+        if 'loop_start_index' in info:
+            addHeader()
+            loopStartEvent = self.events[info['loop_start_index']]
+        else:
+            loopStartEvent = insertAtTime(info['loop_start'])
+            addHeader()
+
         self.events.append(JumpSequenceEvent(loopStartEvent))
         self.events.append(EndTrackSequenceEvent())
         self.events.append(EndTrackSequenceEvent())
 
         prefix = 'SMF_' + info['internal_name'] + '_v_'
-        self.labels.append((prefix + 'Begin', self.events[0])) # unknown B0
-        self.labels.append((prefix + 'End', self.events[-1])) # track end
-        self.labels.append((prefix + 'Start', self.events[0])) # unknown B0
-        self.labels.append((prefix + 'Track_0', self.events[1])) # mono-poly
+        self.labels.append((prefix + 'Begin', self.events[0]))    # unknown B0
+        self.labels.append((prefix + 'End', self.events[-1]))     # track end
+        self.labels.append((prefix + 'Start', self.events[0]))    # unknown B0
+        self.labels.append((prefix + 'Track_0', self.events[1]))  # mono-poly
         self.labels.append((prefix + 'Track_0_LoopStart', loopStartEvent))
 
         return self
